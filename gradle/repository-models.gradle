@@ -1,0 +1,614 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonParserType
+import groovy.json.JsonSlurper
+
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
+import java.nio.ByteBuffer
+import java.nio.charset.Charset
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.security.MessageDigest
+import java.text.Normalizer
+import java.util.zip.DeflaterOutputStream
+import java.util.zip.InflaterInputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipException
+import java.util.zip.ZipFile
+
+def modelRepositoryRoot = project.file('../Yes-Steve-Model-Repo')
+def generatedModelExpansionResources = layout.buildDirectory.dir('generated/ysm-model-expansion-resources')
+
+def binaryYsmInputs = providers.provider {
+    if (!modelRepositoryRoot.isDirectory()) return []
+    return fileTree(modelRepositoryRoot) {
+        include '**/*.ysm'
+    }.files.findAll { File file ->
+        if (file.length() < 24L || file.length() > 64L * 1024L * 1024L) return false
+        file.withInputStream { input ->
+            byte[] header = new byte[8]
+            int read = input.read(header)
+            if (read != header.length) return false
+            int magic = ByteBuffer.wrap(header, 0, 4).getInt()
+            int version = ByteBuffer.wrap(header, 4, 4).getInt()
+            return magic == 0x59534750 && (version == 1 || version == 2)
+        }
+    }
+}
+def repositoryZipInputs = fileTree(modelRepositoryRoot) {
+    include '**/*.zip'
+}
+
+tasks.register('generateModelExpansionModels') {
+    group = 'ysm'
+    description = 'Validates and packages legacy-compatible expansion models from the source model checkout.'
+
+    inputs.property('generatorVersion', 2)
+    inputs.files(binaryYsmInputs).withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(repositoryZipInputs).withPathSensitivity(PathSensitivity.RELATIVE)
+    if (new File(modelRepositoryRoot, 'README.md').isFile()) {
+        inputs.file(new File(modelRepositoryRoot, 'README.md'))
+    }
+    outputs.dir(generatedModelExpansionResources)
+
+    doLast {
+        if (!modelRepositoryRoot.isDirectory()) {
+            throw new GradleException("Missing sibling model repository: ${modelRepositoryRoot}")
+        }
+
+        File outputRoot = generatedModelExpansionResources.get().asFile
+        project.delete(outputRoot)
+        File assetRoot = new File(outputRoot, 'assets/ysmu_model_expansion')
+        File modelsRoot = new File(assetRoot, 'models')
+        File metaInfRoot = new File(outputRoot, 'META-INF')
+        modelsRoot.mkdirs()
+        metaInfRoot.mkdirs()
+
+        final int maxStringBytes = 4096
+        final int maxFileBytes = 64 * 1024 * 1024
+        final long maxModelBytes = 128L * 1024L * 1024L
+        final int maxYsgpEntries = 1024
+        final int maxZipEntries = 10_000
+        Set<String> supportedGeometryVersions = ['1.12.0', '1.14.0', '1.21.0'] as Set
+        JsonSlurper jsonSlurper = new JsonSlurper()
+        JsonSlurper legacyJsonSlurper = new JsonSlurper().setType(JsonParserType.LAX)
+        List<Map<String, String>> manifestRows = []
+        List<Map<String, Object>> acceptedModels = []
+        List<String> skippedModels = []
+        Set<String> usedModelIds = new LinkedHashSet<>()
+
+        Closure<String> repositoryRelativePath = { File file ->
+            modelRepositoryRoot.toPath().toAbsolutePath().normalize()
+                .relativize(file.toPath().toAbsolutePath().normalize()).toString().replace('\\', '/')
+        }
+        Closure<String> singleLine = { Object value ->
+            value == null ? '' : value.toString().replaceAll(/[\r\n\t]+/, ' ').trim()
+        }
+        Closure<String> sanitizeIdPart = { String value ->
+            String ascii = Normalizer.normalize(value ?: '', Normalizer.Form.NFKD)
+                .replaceAll(/\p{M}+/, '')
+                .toLowerCase(Locale.ROOT)
+                .replaceAll(/[^a-z0-9_.-]+/, '_')
+                .replaceAll(/_+/, '_')
+                .replaceAll(/\.+/, '.')
+                .replaceAll(/^[^a-z0-9]+|[^a-z0-9]+$/, '')
+            if (ascii.length() > 40) ascii = ascii.substring(0, 40)
+            return ascii ?: 'model'
+        }
+        Closure<String> shortHash = { String value ->
+            byte[] digest = MessageDigest.getInstance('SHA-256')
+                .digest(value.getBytes(StandardCharsets.UTF_8))
+            StringBuilder output = new StringBuilder()
+            for (int index = 0; index < 4; index++) output.append(String.format('%02x', digest[index] & 0xff))
+            return output.toString()
+        }
+        Closure<String> modelIdFor = { File file ->
+            String relative = repositoryRelativePath(file)
+            List<String> segments = relative.split('/') as List<String>
+            String category = segments.size() > 1 ? segments[0].replaceFirst(/^_+/, '') : 'uncategorized'
+            String fileName = file.name
+            int extension = fileName.lastIndexOf('.')
+            String baseName = extension > 0 ? fileName.substring(0, extension) : fileName
+            String modelId = "exp_${sanitizeIdPart(category)}_${sanitizeIdPart(baseName)}_${shortHash(relative)}"
+            if (modelId.length() > 128) modelId = modelId.substring(0, 119) + '_' + shortHash(relative)
+            if (!usedModelIds.add(modelId)) {
+                throw new GradleException("Duplicate generated model expansion id: ${modelId}")
+            }
+            return modelId
+        }
+        Closure<byte[]> readExact = { InputStream input, int size, String label ->
+            if (size < 0 || size > maxFileBytes) throw new GradleException("Invalid ${label} size: ${size}")
+            byte[] data = new byte[size]
+            int offset = 0
+            while (offset < size) {
+                int read = input.read(data, offset, size - offset)
+                if (read < 0) throw new GradleException("Truncated ${label}")
+                offset += read
+            }
+            return data
+        }
+        Closure<Integer> readInt = { InputStream input, String label ->
+            byte[] data = readExact(input, 4, label)
+            return ByteBuffer.wrap(data).getInt()
+        }
+        Closure<byte[]> decryptAes = { byte[] key, byte[] iv, byte[] data ->
+            if (key.length != 16 || iv.length != 16) throw new GradleException('Invalid YSGP AES key or IV')
+            Cipher cipher = Cipher.getInstance('AES/CBC/PKCS5Padding')
+            cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, 'AES'), new IvParameterSpec(iv))
+            return cipher.doFinal(data)
+        }
+        Closure<byte[]> encryptAes = { byte[] key, byte[] iv, byte[] data ->
+            if (key.length != 16 || iv.length != 16) throw new GradleException('Invalid YSGP AES key or IV')
+            Cipher cipher = Cipher.getInstance('AES/CBC/PKCS5Padding')
+            cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, 'AES'), new IvParameterSpec(iv))
+            return cipher.doFinal(data)
+        }
+        Closure<byte[]> deflate = { byte[] rawData, String label ->
+            ByteArrayOutputStream output = new ByteArrayOutputStream()
+            new DeflaterOutputStream(output).withCloseable { stream -> stream.write(rawData) }
+            if (output.size() > maxFileBytes) {
+                throw new GradleException("Compressed ${label} exceeds ${maxFileBytes} bytes")
+            }
+            return output.toByteArray()
+        }
+        Closure<byte[]> inflateBounded = { byte[] compressed, String label ->
+            ByteArrayOutputStream output = new ByteArrayOutputStream()
+            new InflaterInputStream(new ByteArrayInputStream(compressed)).withCloseable { input ->
+                byte[] buffer = new byte[8192]
+                int read
+                while ((read = input.read(buffer)) != -1) {
+                    if ((long) output.size() + read > maxFileBytes) {
+                        throw new GradleException("Inflated ${label} exceeds ${maxFileBytes} bytes")
+                    }
+                    output.write(buffer, 0, read)
+                }
+            }
+            return output.toByteArray()
+        }
+        Closure<byte[]> versionTwoKey = { byte[] encryptedData ->
+            byte[] md5 = MessageDigest.getInstance('MD5').digest(encryptedData)
+            long seed = 0L
+            for (byte value : md5) seed = (seed << 8) + (value & 0xff)
+            byte[] key = new byte[16]
+            new Random(seed).nextBytes(key)
+            return key
+        }
+        Closure<Map<String, byte[]>> decodeYsgp = { byte[] packageData ->
+            if (packageData.length < 24) throw new GradleException('YSGP package is shorter than its header')
+            ByteBuffer header = ByteBuffer.wrap(packageData)
+            if (header.getInt() != 0x59534750) throw new GradleException('YSGP package has an invalid magic value')
+            int version = header.getInt()
+            if (version != 1 && version != 2) throw new GradleException("Unsupported binary YSGP version ${version}")
+            byte[] expectedMd5 = Arrays.copyOfRange(packageData, 8, 24)
+            byte[] payload = Arrays.copyOfRange(packageData, 24, packageData.length)
+            byte[] actualMd5 = MessageDigest.getInstance('MD5').digest(payload)
+            if (!Arrays.equals(expectedMd5, actualMd5)) throw new GradleException('YSGP outer MD5 does not match')
+
+            Map<String, byte[]> files = new LinkedHashMap<>()
+            ByteArrayInputStream input = new ByteArrayInputStream(payload)
+            long totalBytes = 0L
+            int entryCount = 0
+            while (input.available() > 0) {
+                if (++entryCount > maxYsgpEntries) throw new GradleException('YSGP package has too many members')
+                int nameLength = readInt(input, 'YSGP file name')
+                if (nameLength <= 0 || nameLength > maxStringBytes) {
+                    throw new GradleException("Invalid YSGP file name length: ${nameLength}")
+                }
+                byte[] encodedName = readExact(input, nameLength, 'YSGP file name')
+                String fileName = version == 2
+                    ? new String(Base64.getDecoder().decode(encodedName), StandardCharsets.UTF_8)
+                    : new String(encodedName, StandardCharsets.UTF_8)
+                if (!fileName || fileName.contains('/') || fileName.contains('\\') || fileName.contains('..')) {
+                    throw new GradleException("Unsafe YSGP member name: ${fileName}")
+                }
+
+                int encryptedSize = readInt(input, "${fileName} encrypted data")
+                byte[] rawData
+                if (version == 1) {
+                    byte[] key = readExact(input, 16, "${fileName} key")
+                    byte[] iv = readExact(input, 16, "${fileName} IV")
+                    byte[] encrypted = readExact(input, encryptedSize, "${fileName} encrypted data")
+                    rawData = inflateBounded(decryptAes(key, iv, encrypted), fileName)
+                } else {
+                    int cipherKeySize = readInt(input, "${fileName} cipher key")
+                    if (cipherKeySize <= 0 || cipherKeySize > 1024) {
+                        throw new GradleException("Invalid ${fileName} cipher key length: ${cipherKeySize}")
+                    }
+                    byte[] cipherKey = readExact(input, cipherKeySize, "${fileName} cipher key")
+                    byte[] iv = readExact(input, 16, "${fileName} IV")
+                    byte[] encrypted = readExact(input, encryptedSize, "${fileName} encrypted data")
+                    byte[] key = decryptAes(versionTwoKey(encrypted), iv, cipherKey)
+                    rawData = inflateBounded(decryptAes(key, iv, encrypted), fileName)
+                }
+                totalBytes += rawData.length
+                if (totalBytes > maxModelBytes) throw new GradleException('YSGP model exceeds the unpacked size limit')
+                if (files.put(fileName, rawData) != null) throw new GradleException("Duplicate YSGP member: ${fileName}")
+            }
+            return files
+        }
+        Closure<Map> parseGeometry = { byte[] data, String label ->
+            Object parsed = jsonSlurper.parseText(new String(data, StandardCharsets.UTF_8))
+            if (!(parsed instanceof Map)) throw new GradleException("${label} is not a JSON object")
+            Map geometry = parsed as Map
+            String version = geometry.format_version?.toString()
+            if (!supportedGeometryVersions.contains(version)) {
+                throw new GradleException("${label} uses unsupported geometry version ${version}")
+            }
+            if (!(geometry['minecraft:geometry'] instanceof List) || geometry['minecraft:geometry'].isEmpty()) {
+                throw new GradleException("${label} has no minecraft:geometry entry")
+            }
+            return geometry
+        }
+        Closure<Map<String, Object>> validateModelFiles = { Map<String, byte[]> files, String label ->
+            if (!files.containsKey('main.json') || !files.containsKey('arm.json')) {
+                throw new GradleException("${label} is missing main.json or arm.json")
+            }
+            List<String> textures = files.keySet().findAll { String name -> name.endsWith('.png') }.toList()
+            if (textures.isEmpty()) throw new GradleException("${label} has no lowercase PNG texture")
+            textures.each { String textureName ->
+                if (textureName.contains('..') || !textureName.matches(/[a-z0-9][a-z0-9_.-]*\.png/)) {
+                    throw new GradleException("${label}/${textureName} is not a safe texture name")
+                }
+                byte[] texture = files[textureName]
+                if (texture.length < 8
+                    || (texture[0] & 0xff) != 0x89 || (texture[1] & 0xff) != 0x50
+                    || (texture[2] & 0xff) != 0x4e || (texture[3] & 0xff) != 0x47
+                    || (texture[4] & 0xff) != 0x0d || (texture[5] & 0xff) != 0x0a
+                    || (texture[6] & 0xff) != 0x1a || (texture[7] & 0xff) != 0x0a) {
+                    throw new GradleException("${label}/${textureName} is not a PNG file")
+                }
+            }
+            Map mainGeometry = parseGeometry(files['main.json'], "${label}/main.json")
+            parseGeometry(files['arm.json'], "${label}/arm.json")
+            Map extraInfo = [:]
+            Object geometries = mainGeometry['minecraft:geometry']
+            if (geometries instanceof List && !geometries.isEmpty() && geometries[0] instanceof Map) {
+                Object description = geometries[0].description
+                if (description instanceof Map && description.ysm_extra_info instanceof Map) {
+                    extraInfo = description.ysm_extra_info as Map
+                }
+            }
+            return [textures: textures, extraInfo: extraInfo]
+        }
+        Closure<byte[]> normalizeLegacyJson = { byte[] data, String label ->
+            try {
+                String text = new String(data, StandardCharsets.UTF_8)
+                if (text.startsWith('\uFEFF')) text = text.substring(1)
+                Object parsed = legacyJsonSlurper.parseText(text)
+                byte[] normalized = (JsonOutput.prettyPrint(JsonOutput.toJson(parsed)) + System.lineSeparator())
+                    .getBytes(StandardCharsets.UTF_8)
+                if (normalized.length > maxFileBytes) {
+                    throw new GradleException("Normalized ${label} exceeds ${maxFileBytes} bytes")
+                }
+                return normalized
+            } catch (Exception exception) {
+                throw new GradleException("${label} is not valid legacy JSON: ${exception.message}", exception)
+            }
+        }
+        Closure<byte[]> encodeYsgpV1 = { Map<String, byte[]> files, String sourcePath ->
+            ByteArrayOutputStream payloadOutput = new ByteArrayOutputStream()
+            DataOutputStream payload = new DataOutputStream(payloadOutput)
+            files.keySet().toList().sort().each { String fileName ->
+                byte[] name = fileName.getBytes(StandardCharsets.UTF_8)
+                if (name.length == 0 || name.length > maxStringBytes) {
+                    throw new GradleException("Invalid normalized YSGP member name: ${fileName}")
+                }
+                byte[] compressed = deflate(files[fileName], "${sourcePath}/${fileName}")
+                MessageDigest keyDigest = MessageDigest.getInstance('SHA-256')
+                keyDigest.update(sourcePath.getBytes(StandardCharsets.UTF_8))
+                keyDigest.update((byte) 0)
+                keyDigest.update(fileName.getBytes(StandardCharsets.UTF_8))
+                keyDigest.update((byte) 0)
+                keyDigest.update(MessageDigest.getInstance('SHA-256').digest(files[fileName]))
+                byte[] keyMaterial = keyDigest.digest()
+                byte[] key = Arrays.copyOfRange(keyMaterial, 0, 16)
+                byte[] iv = Arrays.copyOfRange(keyMaterial, 16, 32)
+                byte[] encrypted = encryptAes(key, iv, compressed)
+                payload.writeInt(name.length)
+                payload.write(name)
+                payload.writeInt(encrypted.length)
+                payload.write(key)
+                payload.write(iv)
+                payload.write(encrypted)
+            }
+            payload.close()
+            byte[] payloadData = payloadOutput.toByteArray()
+            ByteArrayOutputStream packageOutput = new ByteArrayOutputStream()
+            DataOutputStream output = new DataOutputStream(packageOutput)
+            output.writeInt(0x59534750)
+            output.writeInt(1)
+            output.write(MessageDigest.getInstance('MD5').digest(payloadData))
+            output.write(payloadData)
+            output.close()
+            if (packageOutput.size() > maxModelBytes) {
+                throw new GradleException("Normalized YSGP package exceeds ${maxModelBytes} bytes")
+            }
+            return packageOutput.toByteArray()
+        }
+        Closure<byte[]> readZipEntry = { ZipFile zip, ZipEntry entry, int maximum, String label ->
+            if (entry == null || entry.directory || entry.size == 0 || entry.size > maximum) {
+                throw new GradleException("Invalid ZIP member ${label}")
+            }
+            ByteArrayOutputStream output = new ByteArrayOutputStream(
+                entry.size > 0 ? (int) Math.min(entry.size, 1024L * 1024L) : 8192)
+            zip.getInputStream(entry).withCloseable { input ->
+                byte[] buffer = new byte[8192]
+                int read
+                while ((read = input.read(buffer)) != -1) {
+                    if ((long) output.size() + read > maximum) {
+                        throw new GradleException("ZIP member ${label} exceeds ${maximum} bytes")
+                    }
+                    output.write(buffer, 0, read)
+                }
+            }
+            return output.toByteArray()
+        }
+        Closure<ZipFile> openRepositoryZip = { File file ->
+            try {
+                return new ZipFile(file)
+            } catch (ZipException exception) {
+                if (!exception.message?.contains('invalid CEN header (bad entry name)')) throw exception
+                return new ZipFile(file, Charset.forName('GBK'))
+            }
+        }
+        Closure<Void> writeGenerated = { String relativePath, byte[] data ->
+            File destination = new File(assetRoot, relativePath)
+            destination.parentFile.mkdirs()
+            destination.bytes = data
+            return null
+        }
+        Closure<Void> addManifestRow = { String modelId, String type, String resource, String destination,
+            String source ->
+            manifestRows.add([
+                modelId   : modelId,
+                type      : type,
+                resource  : resource,
+                destination: destination,
+                source    : singleLine(source)
+            ])
+            return null
+        }
+
+        List<File> ysgpFiles = binaryYsmInputs.get().toList().sort { File left, File right ->
+            repositoryRelativePath(left) <=> repositoryRelativePath(right)
+        }
+        ysgpFiles.each { File sourceFile ->
+            String sourcePath = repositoryRelativePath(sourceFile)
+            String modelId = null
+            try {
+                modelId = modelIdFor(sourceFile)
+                byte[] packageData = Files.readAllBytes(sourceFile.toPath())
+                Map<String, byte[]> decoded = decodeYsgp(packageData)
+                Map<String, Object> modelInfo
+                try {
+                    modelInfo = validateModelFiles(decoded, sourcePath)
+                    String resourcePath = "models/${modelId}.ysm"
+                    String destination = "${modelId}.ysm"
+                    writeGenerated(resourcePath, packageData)
+                    addManifestRow(modelId, 'ysm', resourcePath, destination, sourcePath)
+                } catch (Exception directPackageException) {
+                    Map<String, byte[]> normalized = new LinkedHashMap<>()
+                    ['main.json', 'arm.json', 'main.animation.json', 'arm.animation.json', 'extra.animation.json']
+                        .each { String jsonName ->
+                            if (decoded.containsKey(jsonName)) {
+                                normalized[jsonName] = normalizeLegacyJson(
+                                    decoded[jsonName], "${sourcePath}/${jsonName}")
+                            }
+                        }
+                    Set<String> textureNames = new LinkedHashSet<>()
+                    decoded.each { String fileName, byte[] data ->
+                        if (!fileName.endsWith('.png')) return
+                        String outputName = fileName.toLowerCase(Locale.ROOT)
+                            .replaceAll(/[^a-z0-9_.-]+/, '_')
+                            .replaceAll(/\.+/, '.')
+                            .replaceAll(/^[^a-z0-9]+/, '')
+                        if (!outputName.endsWith('.png') || !textureNames.add(outputName)) {
+                            outputName = "texture_${shortHash(fileName)}.png"
+                            if (!textureNames.add(outputName)) {
+                                throw new GradleException("Duplicate texture output ${outputName}")
+                            }
+                        }
+                        normalized[outputName] = data
+                    }
+                    modelInfo = validateModelFiles(normalized, sourcePath)
+                    byte[] normalizedPackage = encodeYsgpV1(normalized, sourcePath)
+                    String resourcePath = "models/${modelId}.ysm"
+                    String destination = "${modelId}.ysm"
+                    writeGenerated(resourcePath, normalizedPackage)
+                    addManifestRow(modelId, 'ysm', resourcePath, destination, sourcePath)
+                }
+                Map extraInfo = modelInfo.extraInfo as Map
+                acceptedModels.add([
+                    id      : modelId,
+                    type    : 'YSGP',
+                    source  : sourcePath,
+                    name    : extraInfo.name ?: sourceFile.name,
+                    authors : extraInfo.authors ?: [],
+                    license : extraInfo.license ?: 'Not specified',
+                    textures: (modelInfo.textures as List).size()
+                ])
+            } catch (Exception exception) {
+                if (modelId != null) {
+                    project.delete(new File(modelsRoot, "${modelId}.ysm"))
+                    project.delete(new File(modelsRoot, modelId))
+                    manifestRows.removeAll { Map row -> row.modelId == modelId }
+                    usedModelIds.remove(modelId)
+                }
+                skippedModels.add("${sourcePath}: ${exception.message}")
+            }
+        }
+
+        List<File> zipFiles = repositoryZipInputs.files.toList().sort { File left, File right ->
+            repositoryRelativePath(left) <=> repositoryRelativePath(right)
+        }
+        zipFiles.each { File sourceFile ->
+            String sourcePath = repositoryRelativePath(sourceFile)
+            String modelId = null
+            try {
+                ZipFile zip = openRepositoryZip(sourceFile)
+                try {
+                    List<ZipEntry> entries = Collections.list(zip.entries()).findAll { ZipEntry entry -> !entry.directory }
+                    if (entries.size() > maxZipEntries) throw new GradleException('ZIP has too many file members')
+                    Map<String, ZipEntry> entriesByName = new LinkedHashMap<>()
+                    entries.each { ZipEntry entry ->
+                        String name = entry.name.replace('\\', '/')
+                        List<String> segments = name.split('/', -1) as List<String>
+                        if (!name || name.startsWith('/') || name.contains(':')
+                            || segments.any { String segment -> segment.isEmpty() || segment == '.' || segment == '..' }) {
+                            throw new GradleException("Unsafe ZIP member path: ${name}")
+                        }
+                        if (entriesByName.put(name, entry) != null) {
+                            throw new GradleException("Duplicate ZIP member path: ${name}")
+                        }
+                    }
+
+                    List<String> roots = []
+                    entriesByName.keySet().findAll { String name ->
+                        name == 'main.json' || name.endsWith('/main.json')
+                    }.each { String mainName ->
+                        String root = mainName.substring(0, mainName.length() - 'main.json'.length())
+                        if (entriesByName.containsKey(root + 'arm.json')) {
+                            List<String> pngs = entriesByName.keySet().findAll { String name ->
+                                if (!name.startsWith(root)) return false
+                                String relative = name.substring(root.length()).toLowerCase(Locale.ROOT)
+                                return relative.endsWith('.png')
+                                    && (!relative.contains('/') || relative.startsWith('textures/'))
+                            }.toList()
+                            if (!pngs.isEmpty()) roots.add(root)
+                        }
+                    }
+                    roots = roots.unique()
+                    if (roots.size() != 1) throw new GradleException("ZIP contains ${roots.size()} compatible model roots")
+                    String root = roots[0]
+
+                    Map<String, byte[]> selected = new LinkedHashMap<>()
+                    selected['main.json'] = readZipEntry(zip, entriesByName[root + 'main.json'], maxFileBytes, 'main.json')
+                    selected['arm.json'] = readZipEntry(zip, entriesByName[root + 'arm.json'], maxFileBytes, 'arm.json')
+                    ['main.animation.json', 'arm.animation.json', 'extra.animation.json'].each { String animation ->
+                        ZipEntry entry = entriesByName[root + animation]
+                        if (entry != null) selected[animation] = readZipEntry(zip, entry, maxFileBytes, animation)
+                    }
+                    Set<String> textureNames = new LinkedHashSet<>()
+                    entriesByName.each { String name, ZipEntry entry ->
+                        if (!name.startsWith(root)) return
+                        String relative = name.substring(root.length())
+                        String loweredRelative = relative.toLowerCase(Locale.ROOT)
+                        if (!loweredRelative.endsWith('.png')
+                            || (loweredRelative.contains('/') && !loweredRelative.startsWith('textures/'))) return
+                        String outputName = new File(relative).name.toLowerCase(Locale.ROOT)
+                            .replaceAll(/[^a-z0-9_.-]+/, '_')
+                            .replaceAll(/\.+/, '.')
+                            .replaceAll(/^[^a-z0-9]+/, '')
+                        if (!outputName.endsWith('.png') || !textureNames.add(outputName)) {
+                            outputName = "texture_${shortHash(name)}.png"
+                            if (!textureNames.add(outputName)) throw new GradleException("Duplicate texture output ${outputName}")
+                        }
+                        selected[outputName] = readZipEntry(zip, entry, maxFileBytes, relative)
+                    }
+
+                    selected.keySet().findAll { String fileName -> fileName.endsWith('.json') }.each { String fileName ->
+                        selected[fileName] = normalizeLegacyJson(selected[fileName], "${sourcePath}/${fileName}")
+                    }
+
+                    long totalBytes = selected.values().sum { byte[] data -> data.length } as long
+                    if (totalBytes > maxModelBytes) throw new GradleException('ZIP model exceeds the unpacked size limit')
+                    Map<String, Object> modelInfo = validateModelFiles(selected, sourcePath)
+                    Map mainGeometry = parseGeometry(selected['main.json'], "${sourcePath}/main.json")
+                    Map firstGeometry = (mainGeometry['minecraft:geometry'] as List)[0] as Map
+                    Map description = firstGeometry.description instanceof Map ? firstGeometry.description as Map : [:]
+                    firstGeometry.description = description
+                    if (!(description.ysm_extra_info instanceof Map)) {
+                        description.ysm_extra_info = [
+                            name   : sourceFile.name.substring(0, sourceFile.name.length() - 4),
+                            tips   : "Yes-Steve-Model-Repo/${sourcePath}",
+                            authors: [],
+                            license: 'Repository public model'
+                        ]
+                    }
+                    selected['main.json'] = (JsonOutput.prettyPrint(JsonOutput.toJson(mainGeometry))
+                        + System.lineSeparator()).getBytes(StandardCharsets.UTF_8)
+
+                    modelId = modelIdFor(sourceFile)
+                    selected.each { String fileName, byte[] data ->
+                        String resourcePath = "models/${modelId}/${fileName}"
+                        String destination = "${modelId}/${fileName}"
+                        writeGenerated(resourcePath, data)
+                        addManifestRow(modelId, 'folder', resourcePath, destination, sourcePath)
+                    }
+                    Map extraInfo = description.ysm_extra_info as Map
+                    acceptedModels.add([
+                        id      : modelId,
+                        type    : 'ZIP',
+                        source  : sourcePath,
+                        name    : extraInfo.name ?: sourceFile.name,
+                        authors : extraInfo.authors ?: [],
+                        license : extraInfo.license ?: 'Not specified',
+                        textures: textureNames.size()
+                    ])
+                } finally {
+                    zip.close()
+                }
+            } catch (Exception exception) {
+                if (modelId != null) {
+                    project.delete(new File(modelsRoot, modelId))
+                    manifestRows.removeAll { Map row -> row.modelId == modelId }
+                    usedModelIds.remove(modelId)
+                }
+                skippedModels.add("${sourcePath}: ${exception.message}")
+            }
+        }
+
+        manifestRows.sort { Map left, Map right ->
+            int modelCompare = left.modelId <=> right.modelId
+            return modelCompare != 0 ? modelCompare : left.destination <=> right.destination
+        }
+        String manifest = manifestRows.collect { Map row ->
+            [row.modelId, row.type, row.resource, row.destination, row.source].join('\t')
+        }.join(System.lineSeparator())
+        new File(assetRoot, 'models.tsv').setText(
+            manifest + (manifest.isEmpty() ? '' : System.lineSeparator()), 'UTF-8')
+
+        StringBuilder notice = new StringBuilder()
+        notice.append('# Yes Steve Model Expansion Resources').append(System.lineSeparator()).append(System.lineSeparator())
+        notice.append('Source checkout: `../Yes-Steve-Model-Repo` (')
+            .append('https://github.com/Inf1nlty/Yes-Steve-Model-Repo').append(').')
+            .append(System.lineSeparator()).append(System.lineSeparator())
+        notice.append('The upstream README states that model creators made these files free for everyone and credits ')
+            .append('the original YSM author for advertising the repository. The repository does not contain a root LICENSE; ')
+            .append('individual embedded metadata remains authoritative. This addon preserves compatible model content and metadata, ')
+            .append('normalizes legacy JSON only when required by the MITE runtime, records source paths, and does not claim ownership. ')
+            .append('Modern text/crypto-3 packages are not decoded or included.')
+            .append(System.lineSeparator()).append(System.lineSeparator())
+        acceptedModels.sort { Map left, Map right -> left.id <=> right.id }.each { Map model ->
+            String authors = model.authors instanceof Collection
+                ? model.authors.collect { Object author -> singleLine(author) }.findAll { !it.isEmpty() }.join(', ')
+                : singleLine(model.authors)
+            notice.append('- `').append(model.id).append('` | ').append(singleLine(model.type))
+                .append(' | ').append(singleLine(model.name)).append(' | source `')
+                .append(singleLine(model.source)).append('` | authors: ')
+                .append(authors ?: 'Not specified').append(' | license: ')
+                .append(singleLine(model.license)).append(System.lineSeparator())
+        }
+        if (!skippedModels.isEmpty()) {
+            notice.append(System.lineSeparator()).append('## Skipped').append(System.lineSeparator()).append(System.lineSeparator())
+            skippedModels.sort().each { String skipped ->
+                notice.append('- ').append(singleLine(skipped)).append(System.lineSeparator())
+            }
+        }
+        new File(metaInfRoot, 'YSMU_MODEL_EXPANSION.md').setText(notice.toString(), 'UTF-8')
+
+        int ysgpCount = acceptedModels.count { Map model -> model.type == 'YSGP' }
+        int zipCount = acceptedModels.count { Map model -> model.type == 'ZIP' }
+        logger.lifecycle(
+            "YSM model expansion import: ${acceptedModels.size()} model(s) imported "
+                + "(${ysgpCount} YSGP, ${zipCount} ZIP), ${skippedModels.size()} skipped.")
+        skippedModels.each { String skipped -> logger.lifecycle("YSM model expansion skipped: ${skipped}") }
+    }
+}
+
+sourceSets.main.resources.srcDir(generatedModelExpansionResources)
+
+tasks.named('processResources').configure {
+    dependsOn(tasks.named('generateModelExpansionModels'))
+}
