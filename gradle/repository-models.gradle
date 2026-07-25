@@ -17,7 +17,10 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipException
 import java.util.zip.ZipFile
 
-def modelRepositoryRoot = project.file('../Yes-Steve-Model-Repo')
+def modelRepositoryPath = providers.gradleProperty('modelRepositoryDir')
+    .orElse(providers.environmentVariable('YSM_MODEL_REPOSITORY'))
+    .getOrElse('../Yes-Steve-Model-Repo')
+def modelRepositoryRoot = project.file(modelRepositoryPath)
 def generatedModelExpansionResources = layout.buildDirectory.dir('generated/ysm-model-expansion-resources')
 
 def binaryYsmInputs = providers.provider {
@@ -54,7 +57,10 @@ tasks.register('generateModelExpansionModels') {
 
     doLast {
         if (!modelRepositoryRoot.isDirectory()) {
-            throw new GradleException("Missing sibling model repository: ${modelRepositoryRoot}")
+            throw new GradleException(
+                "Missing model repository: ${modelRepositoryRoot}. " +
+                    "Set -PmodelRepositoryDir=<path> or YSM_MODEL_REPOSITORY."
+            )
         }
 
         File outputRoot = generatedModelExpansionResources.get().asFile
@@ -572,7 +578,7 @@ tasks.register('generateModelExpansionModels') {
         StringBuilder notice = new StringBuilder()
         notice.append('# Yes Steve Model Expansion Resources').append(System.lineSeparator()).append(System.lineSeparator())
         notice.append('Source checkout: `../Yes-Steve-Model-Repo` (')
-            .append('https://github.com/Inf1nlty/Yes-Steve-Model-Repo').append(').')
+            .append('https://github.com/Elaina69/Yes-Steve-Model-Repo').append(').')
             .append(System.lineSeparator()).append(System.lineSeparator())
         notice.append('The upstream README states that model creators made these files free for everyone and credits ')
             .append('the original YSM author for advertising the repository. The repository does not contain a root LICENSE; ')

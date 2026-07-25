@@ -21,6 +21,13 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Checkout model sources
+        uses: actions/checkout@v4
+        with:
+          repository: Elaina69/Yes-Steve-Model-Repo
+          path: model-source
+          persist-credentials: false
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -55,7 +62,7 @@ jobs:
           echo "Saved $TARGET_JAR"
 
       - name: Build
-        run: ./gradlew build
+        run: ./gradlew build -PmodelRepositoryDir="$GITHUB_WORKSPACE/model-source"
 
       - name: Create GitHub Release
         uses: ncipollo/release-action@v1.14.0
