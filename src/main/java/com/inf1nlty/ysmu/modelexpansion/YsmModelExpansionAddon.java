@@ -1,9 +1,9 @@
 package com.inf1nlty.ysmu.modelexpansion;
 
-import java.lang.reflect.Method;
-
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+
+import com.fox.ysmu.model.ServerModelManager;
 
 import net.fabricmc.api.ModInitializer;
 
@@ -17,18 +17,13 @@ public final class YsmModelExpansionAddon implements ModInitializer {
         try {
             ModelExpansionInstaller.InstallResult result = ModelExpansionInstaller.install();
             LOG.info(
-                "Installed {} YSM expansion model(s) with {} resource file(s)",
+                "Prepared {} YSM expansion model(s) with {} resource file(s) ({} changed)",
                 result.modelCount(),
-                result.fileCount());
-            reloadYsmModels();
+                result.fileCount(),
+                result.changedFileCount());
+            if (result.changed()) ServerModelManager.reloadPacks();
         } catch (Exception exception) {
             LOG.error("Unable to install YSM expansion models", exception);
         }
-    }
-
-    private static void reloadYsmModels() throws ReflectiveOperationException {
-        Class<?> manager = Class.forName("com.fox.ysmu.model.ServerModelManager");
-        Method reloadPacks = manager.getMethod("reloadPacks");
-        reloadPacks.invoke(null);
     }
 }

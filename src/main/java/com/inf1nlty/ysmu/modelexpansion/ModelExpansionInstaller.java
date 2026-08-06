@@ -4,6 +4,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -38,30 +39,40 @@ final class ModelExpansionInstaller {
             for (ModelResource resource : resources) currentDestinations.add(resource.destination());
         }
 
+        int changedFiles = 0;
         Set<String> pathsToRemove = new LinkedHashSet<>(previousDestinations);
-        pathsToRemove.addAll(currentDestinations);
-        for (String destination : pathsToRemove) removeManagedDestination(destination);
+        pathsToRemove.removeAll(currentDestinations);
+        for (String destination : pathsToRemove) {
+            if (removeManagedDestination(destination)) changedFiles++;
+        }
 
         Set<String> installedDestinations = new LinkedHashSet<>();
         int installedModels = 0;
         for (Map.Entry<String, List<ModelResource>> model : resourcesByModel.entrySet()) {
-            List<String> copied = new ArrayList<>();
+            List<String> installed = new ArrayList<>();
             try {
                 for (ModelResource resource : model.getValue()) {
-                    copyResource(resource);
-                    copied.add(resource.destination());
+                    if (installResource(resource)) changedFiles++;
+                    installed.add(resource.destination());
                 }
-                installedDestinations.addAll(copied);
+                installedDestinations.addAll(installed);
                 installedModels++;
             } catch (IOException exception) {
-                for (String destination : copied) removeManagedDestination(destination);
                 YsmModelExpansionAddon.LOG.warn(
                     "Skipped incomplete expansion model " + model.getKey(), exception);
+                for (ModelResource resource : model.getValue()) {
+                    if (previousDestinations.contains(resource.destination())
+                        && Files.isRegularFile(resolveDestination(resource.destination()))) {
+                        installedDestinations.add(resource.destination());
+                    } else if (removeManagedDestination(resource.destination())) {
+                        changedFiles++;
+                    }
+                }
             }
         }
 
-        writeState(installedDestinations);
-        return new InstallResult(installedModels, installedDestinations.size());
+        if (!installedDestinations.equals(previousDestinations)) writeState(installedDestinations);
+        return new InstallResult(installedModels, installedDestinations.size(), changedFiles);
     }
 
     private static Map<String, List<ModelResource>> readManifest() throws IOException {
@@ -113,22 +124,54 @@ final class ModelExpansionInstaller {
         return destinations;
     }
 
-    private static void copyResource(ModelResource resource) throws IOException {
+    private static boolean installResource(ModelResource resource) throws IOException {
         Path destination = resolveDestination(resource.destination());
         Path parent = destination.getParent();
         if (parent == null) throw new IOException("Model expansion destination has no parent");
         Files.createDirectories(parent);
-        try (InputStream input = ModelExpansionInstaller.class.getResourceAsStream(
-            RESOURCE_PREFIX + resource.resource())) {
-            if (input == null) throw new IOException("Missing model expansion resource " + resource.resource());
-            Files.copy(input, destination, StandardCopyOption.REPLACE_EXISTING);
+        String resourcePath = RESOURCE_PREFIX + resource.resource();
+        try (InputStream input = openResource(resourcePath)) {
+            if (Files.isRegularFile(destination) && contentEquals(input, destination)) return false;
+        }
+
+        Path temporary = Files.createTempFile(parent, destination.getFileName().toString(), ".tmp");
+        try {
+            try (InputStream input = openResource(resourcePath); OutputStream output = Files.newOutputStream(temporary)) {
+                input.transferTo(output);
+            }
+            moveReplacing(temporary, destination);
+        } finally {
+            Files.deleteIfExists(temporary);
+        }
+        return true;
+    }
+
+    private static InputStream openResource(String resourcePath) throws IOException {
+        InputStream input = ModelExpansionInstaller.class.getResourceAsStream(resourcePath);
+        if (input == null) throw new IOException("Missing model expansion resource " + resourcePath);
+        return input;
+    }
+
+    private static boolean contentEquals(InputStream input, Path destination) throws IOException {
+        try (InputStream existing = Files.newInputStream(destination)) {
+            byte[] bundledBuffer = new byte[8192];
+            byte[] existingBuffer = new byte[8192];
+            while (true) {
+                int bundledLength = input.readNBytes(bundledBuffer, 0, bundledBuffer.length);
+                int existingLength = existing.readNBytes(existingBuffer, 0, existingBuffer.length);
+                if (bundledLength != existingLength) return false;
+                if (bundledLength == 0) return true;
+                for (int index = 0; index < bundledLength; index++) {
+                    if (bundledBuffer[index] != existingBuffer[index]) return false;
+                }
+            }
         }
     }
 
-    private static void removeManagedDestination(String destination) throws IOException {
-        if (!(isStandaloneYsmDestination(destination) || isFolderDestination(destination))) return;
+    private static boolean removeManagedDestination(String destination) throws IOException {
+        if (!(isStandaloneYsmDestination(destination) || isFolderDestination(destination))) return false;
         Path path = resolveDestination(destination);
-        Files.deleteIfExists(path);
+        boolean removed = Files.deleteIfExists(path);
         Path parent = path.getParent();
         Path normalizedCustom = CUSTOM.toAbsolutePath()
             .normalize();
@@ -140,6 +183,7 @@ final class ModelExpansionInstaller {
             }
             parent = parent.getParent();
         }
+        return removed;
     }
 
     private static Path resolveDestination(String destination) throws IOException {
@@ -159,14 +203,14 @@ final class ModelExpansionInstaller {
         Files.createDirectories(STATE_FILE.getParent());
         Path temporary = STATE_FILE.resolveSibling(STATE_FILE.getFileName() + ".tmp");
         Files.write(temporary, sorted, StandardCharsets.UTF_8);
+        moveReplacing(temporary, STATE_FILE);
+    }
+
+    private static void moveReplacing(Path source, Path destination) throws IOException {
         try {
-            Files.move(
-                temporary,
-                STATE_FILE,
-                StandardCopyOption.REPLACE_EXISTING,
-                StandardCopyOption.ATOMIC_MOVE);
+            Files.move(source, destination, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         } catch (AtomicMoveNotSupportedException ignored) {
-            Files.move(temporary, STATE_FILE, StandardCopyOption.REPLACE_EXISTING);
+            Files.move(source, destination, StandardCopyOption.REPLACE_EXISTING);
         }
     }
 
@@ -203,7 +247,11 @@ final class ModelExpansionInstaller {
             || fileName.equals("extra.animation.json") || fileName.endsWith(".png");
     }
 
-    record InstallResult(int modelCount, int fileCount) {}
+    record InstallResult(int modelCount, int fileCount, int changedFileCount) {
+        boolean changed() {
+            return changedFileCount > 0;
+        }
+    }
 
     private record ModelResource(String modelId, String resource, String destination) {}
 }

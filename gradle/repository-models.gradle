@@ -47,7 +47,7 @@ tasks.register('generateModelExpansionModels') {
     group = 'ysm'
     description = 'Validates and packages legacy-compatible expansion models from the source model checkout.'
 
-    inputs.property('generatorVersion', 2)
+    inputs.property('generatorVersion', 3)
     inputs.files(binaryYsmInputs).withPathSensitivity(PathSensitivity.RELATIVE)
     inputs.files(repositoryZipInputs).withPathSensitivity(PathSensitivity.RELATIVE)
     if (new File(modelRepositoryRoot, 'README.md').isFile()) {
@@ -282,7 +282,7 @@ tasks.register('generateModelExpansionModels') {
                 String text = new String(data, StandardCharsets.UTF_8)
                 if (text.startsWith('\uFEFF')) text = text.substring(1)
                 Object parsed = legacyJsonSlurper.parseText(text)
-                byte[] normalized = (JsonOutput.prettyPrint(JsonOutput.toJson(parsed)) + System.lineSeparator())
+                byte[] normalized = (JsonOutput.toJson(parsed) + System.lineSeparator())
                     .getBytes(StandardCharsets.UTF_8)
                 if (normalized.length > maxFileBytes) {
                     throw new GradleException("Normalized ${label} exceeds ${maxFileBytes} bytes")
@@ -532,7 +532,7 @@ tasks.register('generateModelExpansionModels') {
                             license: 'Repository public model'
                         ]
                     }
-                    selected['main.json'] = (JsonOutput.prettyPrint(JsonOutput.toJson(mainGeometry))
+                    selected['main.json'] = (JsonOutput.toJson(mainGeometry)
                         + System.lineSeparator()).getBytes(StandardCharsets.UTF_8)
 
                     modelId = modelIdFor(sourceFile)
