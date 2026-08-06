@@ -32,7 +32,7 @@ dependencies {
     implementation "com.github.MinecraftIsTooEasy:ModMenu:10.1.1"
     implementation 'com.github.MinecraftIsTooEasy:RustedIronCore:1.5.5'
 
-    implementation 'com.github.MinecraftIsTooEasy:YesSteveModel-MITE:1.0.0'
+    implementation 'com.github.MinecraftIsTooEasy:YesSteveModel-MITE:1.0.1'
 
     localRuntime 'com.github.MinecraftIsTooEasy:GeckoLib-MITE:1.0.0'
     localRuntime 'com.github.MinecraftIsTooEasy:FastUtil:8.5.12'
