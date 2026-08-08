@@ -6,11 +6,28 @@ plugins {
 version = project.mod_version
 group = project.maven_group
 
-base {
-    archivesName = project.archives_base_name
-}
+def useLocalizedArchiveName = Locale.default.country.equalsIgnoreCase("CN")
 
-repositories {
+base {
+    // Prefix local JAR names with an optional alias, for example: "[Alias]" + archives_base_name.
+    // Maven publishing keeps using the lowercase maven_id configured below.
+    archivesName = useLocalizedArchiveName
+            ? "[是的史蒂夫模型扩展]${project.archives_base_name}"
+            : project.archives_base_name
+    }
+
+    repositories {
+        // Publication repositories are separate from dependency repositories declared above.
+        // Add or remove release targets here without changing dependency resolution.
+    // Add repositories to retrieve artifacts from in here.
+    // Only declare repositories required by this project because Loom provides
+    // the repositories needed for Minecraft and its libraries automatically.
+    // See https://docs.gradle.org/current/userguide/declaring_repositories.html
+    // for more information about repository declarations.
+    maven {
+        name = "Spongepowered"
+        url = "https://repo.spongepowered.org/repository/maven-public/"
+    }
     maven {
         name = 'ModdedMITE'
         url = uri('https://maven.limingzxc.top/repository/maven-public/')
@@ -22,6 +39,9 @@ configurations {
 }
 
 dependencies {
+    // Dependency versions are maintained in gradle.properties or alongside project-specific declarations below.
+    // Use implementation for required mods, compileOnly for optional integrations,
+    // and localRuntime for mods needed only in the development environment.
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
 
@@ -42,36 +62,55 @@ dependencies {
     localRuntime 'com.github.MinecraftIsTooEasy:Gson:2.10.1'
 }
 
-def fmlResolvedFile = configurations.fml.files.iterator().next()
+def fmlResolvedFile = configurations.fml.singleFile
 
 loom {
     mergedMinecraftJar()
+    setFML(fmlResolvedFile)
+    dependencies.add("mappings", fmlMCPMappings())
 
     mods {
-        'Yes Steve Model: Model Expansion' {
+        "ysmu_model_expansion" {
             sourceSet sourceSets.main
+//            sourceSet sourceSets.client
+//            sourceSet sourceSets.server
+//            For modules in the 'src' directory, only the main source set is required by default.
         }
+    }
+    runs {
+        client {
+            String name = project.username
+            String width = project.screen_width
+            String height = project.screen_height
+            programArgs "--userProperties", "{}", "--username", name, "--session", "a.a.a.a", "--width", width, "--height", height
+        }
+//        server {
+//            programArgs "--", ""
+//        }
     }
 }
 
-loom.setFML(fmlResolvedFile)
-dependencies.add('mappings', loom.fmlMCPMappings())
-
 processResources {
-    inputs.property 'version', project.version
+    inputs.properties(
+            version: project.version,
+            id: project.mod_id,
+            name: project.mod_name
+    )
 
-    filesMatching('fml.mod.json') {
-        expand 'version': project.version
+    filesMatching("fml.mod.json") {
+        expand(inputs.properties)
     }
 }
 
 apply from: 'gradle/repository-models.gradle'
 
 tasks.withType(JavaCompile).configureEach {
-    it.options.release = 17
+    options.release = 17
 }
 
 java {
+    // Loom automatically attaches sourcesJar to remapSourcesJar and the build lifecycle when it is present.
+    // Remove this line only when source artifacts should not be generated.
     withSourcesJar()
     sourceCompatibility = JavaVersion.VERSION_17
     targetCompatibility = JavaVersion.VERSION_17
@@ -83,18 +122,14 @@ tasks.named('sourcesJar').configure {
     exclude('META-INF/YSMU_MODEL_EXPANSION.md')
 }
 
-tasks.named('runClient', JavaExec).configure { exec ->
-    def user = project.hasProperty('username') ? project.username : 'Dev'
-    exec.setArgs(['--username', user, '--session', '0', '--width', '854', '--height', '480'])
-}
-
+// Configure the Maven publication.
 publishing {
     publications {
-        mavenJava(MavenPublication) {
+        create("mavenJava", MavenPublication) {
             groupId = project.maven_group
-            artifactId = project.archives_base_name
+            artifactId = project.maven_id
             version = project.mod_version
-            from components.java
+            from(components.java)
         }
     }
 }
